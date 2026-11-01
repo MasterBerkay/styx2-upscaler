@@ -1,0 +1,31 @@
+// Version information shown in the file properties (and used by Windows reputation checks).
+#include <winver.h>
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_DLL
+FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "MasterBerkay"
+            VALUE "FileDescription", "Styx 2 Upscaler - ReShade add-on for Styx: Shards of Darkness"
+            VALUE "FileVersion", "1.0.0"
+            VALUE "InternalName", "Styx2Upscaler"
+            VALUE "LegalCopyright", "(c) 2026 MasterBerkay, MIT License"
+            VALUE "OriginalFilename", "Styx2Upscaler.addon64"
+            VALUE "ProductName", "Styx 2 Upscaler"
+            VALUE "ProductVersion", "1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

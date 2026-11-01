@@ -1,0 +1,4 @@
+bin/
+obj/
+third_party/
+*.log
