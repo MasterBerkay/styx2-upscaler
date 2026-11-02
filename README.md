@@ -7,6 +7,10 @@ the game's TAA is replaced by **FSR 4** (RX 9000), **FSR 3.1**, **XeSS** or **DL
 - Native AA at the TAA pass (HDR), or quality presets (67 / 59 / 50 %) upscaled at the game's final upscale pass
 - Camera motion vectors from depth plus the engine's own velocity buffer, jitter from the View uniform buffer
 - AMD Anti-Lag 2 (DX11 SDK) with a `SetMaximumFrameLatency` fallback on other GPUs
+- RCAS sharpening (AMD FidelityFX FSR 1 math) on the tone-mapped image before the game's final pass, at native
+  AA and with the presets; live on/off and strength 0..2 (1 = full RCAS, above that a contrast-limited overshoot)
+- `Styx2Compare.flag` next to the exe takes three PNG screenshots of the same view (upscaler + RCAS, upscaler,
+  the game's TAA) for comparisons
 - Settings menu in the ReShade overlay (Dear ImGui); upscaler / preset choice applied on the next start
 - Turns on the engine's TAA (`r.DefaultFeature.AntiAliasing=2`) in the user `Engine.ini`
 
@@ -39,6 +43,8 @@ ReShade 6.x add-on, events on the immediate context. Renderer details and offset
    functions (`NVSDK_NGX_D3D11_Init` is the 5-parameter form). As a proxy DLL loaded at start-up its device /
    DXGI hooks break this game's lighting. The upscaler choice is written to `OptiScaler.ini` right before loading.
 8. **Latency** – AMD Anti-Lag 2 `Update()` at every present of the swap chain device.
+9. **Engine.ini** – the game writes its config back from memory when it exits, dropping entries added after it
+   read the file, so the add-on writes TAA and the preset again when it unloads (and at start for a first install).
 
 `analysis/` holds the frame-trace add-on used to find all of this.
 

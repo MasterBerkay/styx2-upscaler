@@ -11,8 +11,10 @@
 #include <imgui.h>  // Dear ImGui 1.92.5 headers (MIT): ReShade provides the implementation for overlays
 #include <reshade.hpp>
 #include <d3d11_1.h>
+#include <wincodec.h>
 #include <nvsdk_ngx.h>  // types and parameter names only: the functions come from OptiScaler, see LoadNgx
 #include "ffx_antilag2_dx11.h"  // AMD Anti-Lag 2 SDK (MIT), header-only
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -22,6 +24,7 @@
 #include <vector>
 #include "motion_cs.h"
 #include "sanitize_cs.h"
+#include "rcas_cs.h"
 
 using namespace reshade::api;
 
@@ -226,14 +229,55 @@ struct MotionParams {
 
 struct Pass {
     bool failed = false;
-    pipeline_layout layout = {0}, sanitizeLayout = {0};
-    pipeline pipe = {0}, sanitize = {0};
+    pipeline_layout layout = {0}, sanitizeLayout = {0}, rcasLayout = {0};
+    pipeline pipe = {0}, sanitize = {0}, rcas = {0};
     uint32_t width = 0, height = 0;
     resource motion = {0}, depth = {0}, debug = {0}, color = {0}, final = {0};
     resource_view motionUav = {0}, motionSrv = {0}, depthUav = {0}, depthSrv = {0}, debugUav = {0}, colorUav = {0},
                   finalUav = {0};
+    // RCAS output at screen size (EnsureSharpTarget)
+    uint32_t sharpWidth = 0, sharpHeight = 0;
+    resource sharp = {0};
+    resource_view sharpUav = {0}, sharpSrv = {0};
 };
 static Pass g_pass;
+// RCAS before the game's final pass (live, from the overlay): on/off and strength 0..2 (1 = full RCAS).
+static bool g_sharpenEnabled = true;
+static float g_sharpness = 1.0f;
+
+static float SharpnessNow()
+{
+    return g_sharpenEnabled ? g_sharpness : 0.0f;
+}
+
+static void DestroySharpTarget(device* dev)
+{
+    if (g_pass.sharpUav.handle) dev->destroy_resource_view(g_pass.sharpUav);
+    if (g_pass.sharpSrv.handle) dev->destroy_resource_view(g_pass.sharpSrv);
+    if (g_pass.sharp.handle) dev->destroy_resource(g_pass.sharp);
+    g_pass.sharpUav = g_pass.sharpSrv = {0};
+    g_pass.sharp = {0};
+    g_pass.sharpWidth = g_pass.sharpHeight = 0;
+}
+
+static bool EnsureSharpTarget(device* dev, uint32_t w, uint32_t h)
+{
+    if (g_pass.sharp.handle && g_pass.sharpWidth == w && g_pass.sharpHeight == h)
+        return true;
+    DestroySharpTarget(dev);
+    if (!dev->create_resource(resource_desc(w, h, 1, 1, format::r16g16b16a16_float, 1, memory_heap::default_,
+                                            resource_usage::unordered_access | resource_usage::shader_resource),
+                              nullptr, resource_usage::unordered_access, &g_pass.sharp) ||
+        !dev->create_resource_view(g_pass.sharp, resource_usage::unordered_access, resource_view_desc(format::r16g16b16a16_float), &g_pass.sharpUav) ||
+        !dev->create_resource_view(g_pass.sharp, resource_usage::shader_resource, resource_view_desc(format::r16g16b16a16_float), &g_pass.sharpSrv)) {
+        LOGW("sharpening: failed to create %ux%u target", w, h);
+        DestroySharpTarget(dev);
+        return false;
+    }
+    g_pass.sharpWidth = w;
+    g_pass.sharpHeight = h;
+    return true;
+}
 
 static void DestroyPassTextures(device* dev)
 {
@@ -248,6 +292,7 @@ static void DestroyPassTextures(device* dev)
         g_pass.finalUav = {0};
     g_pass.motion = g_pass.depth = g_pass.debug = g_pass.color = g_pass.final = {0};
     g_pass.width = g_pass.height = 0;
+    DestroySharpTarget(dev);
 }
 
 static bool EnsurePass(device* dev, uint32_t w, uint32_t h)
@@ -281,9 +326,20 @@ static bool EnsurePass(device* dev, uint32_t w, uint32_t h)
         scs.code = g_SanitizeCS;
         scs.code_size = sizeof(g_SanitizeCS);
         pipeline_subobject ssub = {pipeline_subobject_type::compute_shader, 1, &scs};
+        // RCAS pass: one SRV in, one UAV out, sharpness as constant.
+        constant_range rConsts = consts;
+        rConsts.count = 4;
+        const pipeline_layout_param rParams[3] = {pipeline_layout_param(sIn), pipeline_layout_param(sOut),
+                                                  pipeline_layout_param(rConsts)};
+        shader_desc rcs = {};
+        rcs.code = g_RcasCS;
+        rcs.code_size = sizeof(g_RcasCS);
+        pipeline_subobject rsub = {pipeline_subobject_type::compute_shader, 1, &rcs};
         if (!dev->create_pipeline_layout(3, params, &g_pass.layout) || !dev->create_pipeline(g_pass.layout, 1, &sub, &g_pass.pipe) ||
             !dev->create_pipeline_layout(2, sParams, &g_pass.sanitizeLayout) ||
-            !dev->create_pipeline(g_pass.sanitizeLayout, 1, &ssub, &g_pass.sanitize)) {
+            !dev->create_pipeline(g_pass.sanitizeLayout, 1, &ssub, &g_pass.sanitize) ||
+            !dev->create_pipeline_layout(3, rParams, &g_pass.rcasLayout) ||
+            !dev->create_pipeline(g_pass.rcasLayout, 1, &rsub, &g_pass.rcas)) {
             LOGW("motion vectors: failed to create compute pipelines");
             g_pass.failed = true;
             return false;
@@ -662,11 +718,14 @@ static bool IsTaaDraw(device* dev, uint32_t indexCount)
     return GetViewInfo(dev, g_psSrv[3]).fmt == format::r16g16_unorm && GetViewInfo(dev, g_psSrv[0]).fmt == format::r24_g8_typeless;
 }
 
-// Upscaling (render resolution below the screen): the TAA pass only builds motion vectors and passes the raw
-// image on; FSR runs at the game's final upscale pass (tone-mapped image -> back buffer). State for that pass:
+// Work left for the game's final pass (tone-mapped image -> back buffer, UI follows):
+// - upscaling (render resolution below the screen): the TAA pass only builds motion vectors and passes the raw
+//   image on; FSR runs on the tone-mapped image at the final pass;
+// - sharpening: RCAS on the tone-mapped image (also at native AA).
 static struct {
     uint32_t frame = 0;  // frame the TAA pass ran in
-    uint32_t width = 0, height = 0;
+    uint32_t width = 0, height = 0;  // size of the final pass's input (render size)
+    bool upscale = false;
     float jitterNdc[2] = {};
 } g_pending;
 
@@ -838,6 +897,7 @@ static bool ReplaceTaa(command_list* cmd)
             g_pending.frame = g_frameId;
             g_pending.width = w;
             g_pending.height = h;
+            g_pending.upscale = true;
             g_pending.jitterNdc[0] = p.jitterNdc[0];
             g_pending.jitterNdc[1] = p.jitterNdc[1];
         }
@@ -849,29 +909,60 @@ static bool ReplaceTaa(command_list* cmd)
     // Back into the game's TAA target, without NaN / Inf (they would reach bloom and eye adaptation).
     Sanitize(cmd, g_up.outputSrv, g_pass.finalUav, w, h);
     cmd->copy_resource(g_pass.final, resource{out.res});
+    g_pending.frame = g_frameId;  // the final pass may still sharpen
+    g_pending.width = w;
+    g_pending.height = h;
+    g_pending.upscale = false;
     return true;
 }
 
-// The game's final upscale pass (tone-mapped render-resolution image -> back buffer, UI follows): upscale that
-// image with FSR and let the game's pass read the result instead, 1:1.
-static bool UpscaleFinalPass(command_list* cmd, bool indexed, uint32_t count, uint32_t instances, uint32_t first,
+// RCAS from `in` (tone-mapped, w x h) into g_pass.sharp. Caller is inside ScopedOwnState.
+static bool Sharpen(command_list* cmd, resource_view in, uint32_t w, uint32_t h)
+{
+    if (!EnsureSharpTarget(cmd->get_device(), w, h))
+        return false;
+    const resource_view none = {0};
+    const float consts[4] = {SharpnessNow(), 0.0f, 0.0f, 0.0f};
+    cmd->bind_pipeline(pipeline_stage::compute_shader, g_pass.rcas);
+    cmd->push_descriptors(shader_stage::compute, g_pass.rcasLayout, 0, descriptor_table_update{{}, 0, 0, 1, descriptor_type::shader_resource_view, &in});
+    cmd->push_descriptors(shader_stage::compute, g_pass.rcasLayout, 1, descriptor_table_update{{}, 0, 0, 1, descriptor_type::unordered_access_view, &g_pass.sharpUav});
+    cmd->push_constants(shader_stage::compute, g_pass.rcasLayout, 2, 0, 4, consts);
+    cmd->dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    cmd->push_descriptors(shader_stage::compute, g_pass.rcasLayout, 0, descriptor_table_update{{}, 0, 0, 1, descriptor_type::shader_resource_view, &none});
+    cmd->push_descriptors(shader_stage::compute, g_pass.rcasLayout, 1, descriptor_table_update{{}, 0, 0, 1, descriptor_type::unordered_access_view, &none});
+    return true;
+}
+
+// The game's final pass (tone-mapped image -> back buffer, UI follows): upscale that image with FSR and/or
+// sharpen it with RCAS, and let the game's pass read the result instead, 1:1.
+static bool ReplaceFinalPass(command_list* cmd, bool indexed, uint32_t count, uint32_t instances, uint32_t first,
                              int32_t vertexOffset, uint32_t firstInstance)
 {
-    device* dev = cmd->get_device();
     auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd->get_native());
     const uint32_t rw = g_pending.width, rh = g_pending.height;
+    resource_view image = {g_psSrv[0]};  // what the game's pass will read
     {
         ScopedOwnState own(ctx);
-        if (!own.ok() || !EnsureFeature(cmd, rw, rh, g_backBufferWidth, g_backBufferHeight, false))
+        if (!own.ok())
             return false;
-        Sanitize(cmd, resource_view{g_psSrv[0]}, g_pass.colorUav, rw, rh);  // also converts to RGBA16F
-        if (!Evaluate(ctx, g_pass.color, rw, rh, g_pending.jitterNdc))
-            return false;
+        if (g_pending.upscale) {
+            if (!EnsureFeature(cmd, rw, rh, g_backBufferWidth, g_backBufferHeight, false))
+                return false;
+            Sanitize(cmd, image, g_pass.colorUav, rw, rh);  // also converts to RGBA16F
+            if (!Evaluate(ctx, g_pass.color, rw, rh, g_pending.jitterNdc))
+                return false;
+            image = g_up.outputSrv;
+        }
+        const uint32_t w = g_pending.upscale ? g_backBufferWidth : rw, h = g_pending.upscale ? g_backBufferHeight : rh;
+        if (SharpnessNow() > 0.0f && Sharpen(cmd, image, w, h))
+            image = g_pass.sharpSrv;
+        else if (!g_pending.upscale)
+            return false;  // nothing to do: let the game draw
     }
     // The game's state is back: draw its pass once more with our image in t0, then restore t0.
     ID3D11ShaderResourceView* gameSrv = nullptr;
     ctx->PSGetShaderResources(0, 1, &gameSrv);
-    ID3D11ShaderResourceView* ours = reinterpret_cast<ID3D11ShaderResourceView*>(g_up.outputSrv.handle);
+    ID3D11ShaderResourceView* ours = reinterpret_cast<ID3D11ShaderResourceView*>(image.handle);
     ctx->PSSetShaderResources(0, 1, &ours);
     if (indexed)
         ctx->DrawIndexedInstanced(count, instances, first, vertexOffset, firstInstance);
@@ -883,11 +974,13 @@ static bool UpscaleFinalPass(command_list* cmd, bool indexed, uint32_t count, ui
     return true;
 }
 
-// The final upscale pass: full-screen draw into the back buffer whose t0 has the render resolution, in a frame
-// whose TAA pass deferred the upscaling.
+// The final pass: full-screen draw into the back buffer whose t0 has the render resolution, in a frame whose
+// TAA pass left work for it.
 static bool IsFinalUpscaleDraw(device* dev, uint32_t count)
 {
     if (g_pending.frame != g_frameId || count > 6 || !g_rtv0 || !g_psSrv[0])
+        return false;
+    if (!g_pending.upscale && SharpnessNow() <= 0.0f)
         return false;
     const ViewInfo rt = GetViewInfo(dev, g_rtv0);
     const ViewInfo src = GetViewInfo(dev, g_psSrv[0]);
@@ -919,7 +1012,7 @@ static bool MaybeUpscaleFinal(command_list* cmd, bool indexed, uint32_t n, uint3
     if (!IsFinalUpscaleDraw(cmd->get_device(), n))
         return false;
     g_pending.frame = 0;
-    return UpscaleFinalPass(cmd, indexed, n, instances, first, vertexOffset, firstInstance);
+    return ReplaceFinalPass(cmd, indexed, n, instances, first, vertexOffset, firstInstance);
 }
 
 static bool OnDraw(command_list* cmd, uint32_t n, uint32_t instances, uint32_t first, uint32_t firstInstance)
@@ -949,10 +1042,157 @@ static bool OnDrawIndexed(command_list* cmd, uint32_t n, uint32_t instances, uin
     return true;
 }
 
-static void OnPresent(command_queue*, swapchain*, const rect*, const rect*, uint32_t, const rect*)
+// ---------------------------------------------------------------- comparison screenshots
+// Creating or rewriting Styx2Compare.flag next to the game exe takes three screenshots of the same view
+// (stand still): upscaler + sharpening, upscaler without sharpening, the game's own TAA. Settings are restored
+// afterwards. PNGs land next to the exe as Styx2Compare_<n>_<what>.png.
+
+// Copies the back buffer to the CPU and writes it as a 32-bit PNG (WIC).
+static bool SaveBackBufferPng(swapchain* sc, const std::wstring& path)
+{
+    auto* tex = reinterpret_cast<ID3D11Texture2D*>(sc->get_current_back_buffer().handle);
+    auto* d3d = reinterpret_cast<ID3D11Device*>(sc->get_device()->get_native());
+    D3D11_TEXTURE2D_DESC desc;
+    tex->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_R10G10B10A2_UNORM && desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+        desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        LOGW("compare: back buffer format %d not supported", static_cast<int>(desc.Format));
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC sd = desc;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0;
+    sd.SampleDesc = {1, 0};
+    ID3D11Texture2D* staging = nullptr;
+    if (FAILED(d3d->CreateTexture2D(&sd, nullptr, &staging)))
+        return false;
+    ID3D11DeviceContext* ctx = nullptr;
+    d3d->GetImmediateContext(&ctx);
+    ctx->CopyResource(staging, tex);
+    std::vector<uint8_t> bgra(static_cast<size_t>(desc.Width) * desc.Height * 4);
+    D3D11_MAPPED_SUBRESOURCE m;
+    bool ok = SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m));
+    if (ok) {
+        for (UINT y = 0; y < desc.Height; ++y) {
+            const auto* src = static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(y) * m.RowPitch;
+            uint8_t* dst = bgra.data() + static_cast<size_t>(y) * desc.Width * 4;
+            for (UINT x = 0; x < desc.Width; ++x, dst += 4) {
+                uint32_t v;
+                memcpy(&v, src + x * 4, 4);
+                if (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+                    dst[2] = static_cast<uint8_t>(((v >> 0) & 1023) * 255 / 1023);
+                    dst[1] = static_cast<uint8_t>(((v >> 10) & 1023) * 255 / 1023);
+                    dst[0] = static_cast<uint8_t>(((v >> 20) & 1023) * 255 / 1023);
+                } else if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                    dst[2] = v & 255;
+                    dst[1] = (v >> 8) & 255;
+                    dst[0] = (v >> 16) & 255;
+                } else {
+                    dst[0] = v & 255;
+                    dst[1] = (v >> 8) & 255;
+                    dst[2] = (v >> 16) & 255;
+                }
+                dst[3] = 255;
+            }
+        }
+        ctx->Unmap(staging, 0);
+    }
+    staging->Release();
+    ctx->Release();
+    if (!ok)
+        return false;
+
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IWICImagingFactory* factory = nullptr;
+    IWICStream* stream = nullptr;
+    IWICBitmapEncoder* encoder = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+    ok = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) &&
+         SUCCEEDED(factory->CreateStream(&stream)) &&
+         SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE)) &&
+         SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)) &&
+         SUCCEEDED(encoder->Initialize(stream, WICBitmapEncoderNoCache)) &&
+         SUCCEEDED(encoder->CreateNewFrame(&frame, nullptr)) && SUCCEEDED(frame->Initialize(nullptr)) &&
+         SUCCEEDED(frame->SetSize(desc.Width, desc.Height)) && SUCCEEDED(frame->SetPixelFormat(&fmt)) &&
+         SUCCEEDED(frame->WritePixels(desc.Height, desc.Width * 4, static_cast<UINT>(bgra.size()), bgra.data())) &&
+         SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit());
+    if (frame) frame->Release();
+    if (encoder) encoder->Release();
+    if (stream) stream->Release();
+    if (factory) factory->Release();
+    return ok;
+}
+
+static void CompareFrameEnd(swapchain* sc)
+{
+    static ULONGLONG lastCheck = 0;
+    static FILETIME lastFlag = {};
+    static int step = -1, wait = 0, shot = 0;
+    static bool savedEnabled = true, savedSharpen = true;
+    struct Step {
+        bool enabled, sharpen;
+        int settleFrames;  // the temporal history needs a moment after a switch
+        const char* name;
+    };
+    static const Step kSteps[] = {{true, true, 30, "1_upscaler_rcas"}, {true, false, 30, "2_upscaler"},
+                                  {false, false, 120, "3_game_taa"}};
+    if (step < 0) {
+        if (GetTickCount64() - lastCheck < 1000)
+            return;
+        lastCheck = GetTickCount64();
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        char flag[MAX_PATH];
+        GetModuleFileNameA(nullptr, flag, MAX_PATH);
+        if (char* slash = strrchr(flag, '\\'))
+            strcpy_s(slash + 1, MAX_PATH - (slash + 1 - flag), "Styx2Compare.flag");
+        if (!GetFileAttributesExA(flag, GetFileExInfoStandard, &fa) || CompareFileTime(&fa.ftLastWriteTime, &lastFlag) == 0)
+            return;
+        const bool first = !lastFlag.dwLowDateTime && !lastFlag.dwHighDateTime;
+        lastFlag = fa.ftLastWriteTime;
+        if (first)
+            return;  // flag left from an earlier session
+        savedEnabled = g_enabled;
+        savedSharpen = g_sharpenEnabled;
+        step = 0;
+        wait = kSteps[0].settleFrames;
+        ++shot;
+        g_enabled = kSteps[0].enabled;
+        g_sharpenEnabled = kSteps[0].sharpen;
+        LOGI("compare: taking screenshots, stand still");
+        return;
+    }
+    if (--wait > 0)
+        return;
+    wchar_t dir[MAX_PATH];
+    GetModuleFileNameW(nullptr, dir, MAX_PATH);
+    if (wchar_t* slash = wcsrchr(dir, L'\\'))
+        slash[1] = L'\0';
+    wchar_t name[96];
+    swprintf_s(name, L"Styx2Compare_%d_%hs.png", shot, kSteps[step].name);
+    const bool saved = SaveBackBufferPng(sc, std::wstring(dir) + name);
+    LOGI("compare: %s %s", kSteps[step].name, saved ? "saved" : "FAILED");
+    if (++step < static_cast<int>(std::size(kSteps))) {
+        g_enabled = kSteps[step].enabled;
+        g_sharpenEnabled = kSteps[step].sharpen;
+        g_up.resetNext = true;
+        wait = kSteps[step].settleFrames;
+        return;
+    }
+    g_enabled = savedEnabled;
+    g_sharpenEnabled = savedSharpen;
+    g_up.resetNext = true;
+    step = -1;
+    LOGI("compare: done");
+}
+
+static void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t, const rect*)
 {
     ++g_frameId;
     LatencyFrameEnd();
+    CompareFrameEnd(sc);
     g_drawIndex = 0;
     // [Debug] LogCandidates=N logs N frames, 20 s after start-up (main menu) and again after 60 s.
     static ULONGLONG start = GetTickCount64();
@@ -986,6 +1226,8 @@ static void OnDestroyDevice(device* dev)
     if (g_pass.pipe.handle) dev->destroy_pipeline(g_pass.pipe);
     if (g_pass.layout.handle) dev->destroy_pipeline_layout(g_pass.layout);
     if (g_pass.sanitize.handle) dev->destroy_pipeline(g_pass.sanitize);
+    if (g_pass.rcas.handle) dev->destroy_pipeline(g_pass.rcas);
+    if (g_pass.rcasLayout.handle) dev->destroy_pipeline_layout(g_pass.rcasLayout);
     if (g_pass.sanitizeLayout.handle) dev->destroy_pipeline_layout(g_pass.sanitizeLayout);
     g_pass = {};
 }
@@ -1028,10 +1270,12 @@ static void SetEngineValue(const std::string& ini, const char* section, const ch
         WritePrivateProfileStringA(section, key, value, ini.c_str());
 }
 
+static bool g_manageEngineIni = true;  // [Upscaler] Enabled at start: 0 leaves Engine.ini to the game (FXAA, 100%)
+
 static void ApplyEngineSettings()
 {
     const std::string ini = EngineIniPath();
-    if (ini.empty())
+    if (ini.empty() || !g_manageEngineIni)
         return;
     // Before the game's very first start the folder does not exist yet; the game keeps entries it finds.
     for (size_t pos = ini.find('\\', 3); pos != std::string::npos; pos = ini.find('\\', pos + 1))
@@ -1119,6 +1363,18 @@ static void DrawSettings(effect_runtime*)
         ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Restart the game to apply the change.");
     else
         ImGui::TextDisabled("Native AA = best image. Lower presets help when the GPU is the bottleneck.");
+    // Live: the final pass reads both every frame. The strength is saved when the slider is released.
+    if (ImGui::Checkbox("Sharpening (RCAS)", &g_sharpenEnabled))
+        WritePrivateProfileStringA("Upscaler", "Sharpening", g_sharpenEnabled ? "1" : "0", AddonIniPath().c_str());
+    ImGui::BeginDisabled(!g_sharpenEnabled);
+    ImGui::SliderFloat("Strength", &g_sharpness, 0.0f, 2.0f, "%.2f");
+    ImGui::EndDisabled();
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        char value[16];
+        snprintf(value, sizeof(value), "%.2f", g_sharpness);
+        WritePrivateProfileStringA("Upscaler", "Sharpness", value, AddonIniPath().c_str());
+    }
+    ImGui::TextDisabled("AMD FidelityFX RCAS on the final image. 1 = full RCAS, 2 = strongest.");
     ImGui::Separator();
     if (ImGui::Checkbox("AMD Anti-Lag 2", &g_antiLag2Wanted))
         WritePrivateProfileStringA("Latency", "AntiLag2", g_antiLag2Wanted ? "1" : "0", AddonIniPath().c_str());
@@ -1144,11 +1400,16 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             // (0 off, 1 motion vectors, 2 pass-through, 3 velocity check), LogCandidates
             const std::string path = AddonIniPath();
             g_enabled = GetPrivateProfileIntA("Upscaler", "Enabled", 1, path.c_str()) != 0;
+            g_manageEngineIni = g_enabled;
             g_quality = GetPrivateProfileIntA("Upscaler", "Quality", 0, path.c_str());
             if (g_quality < 0 || g_quality >= static_cast<int>(std::size(kPresets)))
                 g_quality = 0;
             g_qualityAtStart = g_quality;
             g_antiLag2Wanted = GetPrivateProfileIntA("Latency", "AntiLag2", 1, path.c_str()) != 0;
+            char sharpness[16];
+            g_sharpenEnabled = GetPrivateProfileIntA("Upscaler", "Sharpening", 1, path.c_str()) != 0;
+            GetPrivateProfileStringA("Upscaler", "Sharpness", "1.0", sharpness, sizeof(sharpness), path.c_str());
+            g_sharpness = std::clamp(static_cast<float>(atof(sharpness)), 0.0f, 2.0f);
             g_maxFrameLatency = GetPrivateProfileIntA("Latency", "MaxFrameLatency", 1, path.c_str());
             g_debugView = GetPrivateProfileIntA("Debug", "View", 0, path.c_str());
             g_logCandidates = GetPrivateProfileIntA("Debug", "LogCandidates", 0, path.c_str());
@@ -1173,6 +1434,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         LOGI("Styx 2 Upscaler loaded");
         break;
     case DLL_PROCESS_DETACH:
+        // The game writes Engine.ini back from memory when it exits, dropping entries added after it read the
+        // file: write them again now, after that, so the next start has TAA and the chosen render resolution.
+        ApplyEngineSettings();
         reshade::unregister_addon(module);
         break;
     }
