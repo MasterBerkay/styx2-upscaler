@@ -165,15 +165,31 @@ static void OnMapBuffer(device* dev, resource res, uint64_t offset, uint64_t, ma
         g_mapped[res.handle] = *data;
 }
 
+// The parts of the View buffer ReplaceTaa reads (offset, size), see NOTES.md.
+static const uint32_t kViewParts[][2] = {{416, 16}, {512, 64}, {896, 16}, {944, 8}, {1232, 64}, {1584, 16}, {2128, 16}};
+
+// A mapped buffer is write-combined memory, very slow to read: UE4 maps a 4096-byte buffer hundreds of times per
+// frame in busy scenes, and copying each one whole cost half of the rendering thread. Only a View buffer is copied
+// (projection w = 1 at 428, TAA sample count at 2132), and only the parts that are read.
 static void OnUnmapBuffer(device*, resource res)
 {
     std::lock_guard<std::mutex> lock(g_cbMutex);
     auto it = g_mapped.find(res.handle);
     if (it == g_mapped.end())
         return;
-    auto& v = g_viewData[res.handle];
-    v.assign(static_cast<const uint8_t*>(it->second), static_cast<const uint8_t*>(it->second) + kViewSize);
+    const uint8_t* src = static_cast<const uint8_t*>(it->second);
     g_mapped.erase(it);
+    float w, samples;
+    memcpy(&w, src + 428, 4);
+    memcpy(&samples, src + 2132, 4);
+    if (w != 1.0f || !(samples >= 1.0f)) {
+        g_viewData.erase(res.handle);
+        return;
+    }
+    auto& v = g_viewData[res.handle];
+    v.resize(kViewSize);
+    for (const auto& part : kViewParts)
+        memcpy(v.data() + part[0], src + part[0], part[1]);
 }
 
 static bool OnUpdateBuffer(device* dev, const void* data, resource res, uint64_t offset, uint64_t size)
@@ -187,9 +203,24 @@ static bool OnUpdateBuffer(device* dev, const void* data, resource res, uint64_t
         size = kViewSize - offset;
     if (offset + size > kViewSize)
         return false;
+    const uint8_t* src = static_cast<const uint8_t*>(data);
+    if (offset == 0 && size == kViewSize) {  // whole buffer: as in OnUnmapBuffer, only View buffers and their parts
+        float w, samples;
+        memcpy(&w, src + 428, 4);
+        memcpy(&samples, src + 2132, 4);
+        if (w != 1.0f || !(samples >= 1.0f)) {
+            g_viewData.erase(res.handle);
+            return false;
+        }
+        auto& v = g_viewData[res.handle];
+        v.resize(kViewSize);
+        for (const auto& part : kViewParts)
+            memcpy(v.data() + part[0], src + part[0], part[1]);
+        return false;
+    }
     auto& v = g_viewData[res.handle];
     v.resize(kViewSize);
-    memcpy(v.data() + offset, data, static_cast<size_t>(size));
+    memcpy(v.data() + offset, src, static_cast<size_t>(size));
     return false;
 }
 
