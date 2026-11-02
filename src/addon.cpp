@@ -235,10 +235,12 @@ struct Pass {
     resource motion = {0}, depth = {0}, debug = {0}, color = {0}, final = {0};
     resource_view motionUav = {0}, motionSrv = {0}, depthUav = {0}, depthSrv = {0}, debugUav = {0}, colorUav = {0},
                   finalUav = {0};
-    // RCAS output at screen size (EnsureSharpTarget)
+    // RCAS output at screen size (EnsureSharpTarget); at native AA in the back buffer's format, with a copy of
+    // the back buffer as input
     uint32_t sharpWidth = 0, sharpHeight = 0;
-    resource sharp = {0};
-    resource_view sharpUav = {0}, sharpSrv = {0};
+    format sharpFormat = format::unknown;
+    resource sharp = {0}, copy = {0};
+    resource_view sharpUav = {0}, sharpSrv = {0}, copySrv = {0};
 };
 static Pass g_pass;
 // RCAS before the game's final pass (live, from the overlay): on/off and strength 0..2 (1 = full RCAS).
@@ -254,28 +256,40 @@ static void DestroySharpTarget(device* dev)
 {
     if (g_pass.sharpUav.handle) dev->destroy_resource_view(g_pass.sharpUav);
     if (g_pass.sharpSrv.handle) dev->destroy_resource_view(g_pass.sharpSrv);
+    if (g_pass.copySrv.handle) dev->destroy_resource_view(g_pass.copySrv);
     if (g_pass.sharp.handle) dev->destroy_resource(g_pass.sharp);
-    g_pass.sharpUav = g_pass.sharpSrv = {0};
-    g_pass.sharp = {0};
+    if (g_pass.copy.handle) dev->destroy_resource(g_pass.copy);
+    g_pass.sharpUav = g_pass.sharpSrv = g_pass.copySrv = {0};
+    g_pass.sharp = g_pass.copy = {0};
+    g_pass.sharpFormat = format::unknown;
     g_pass.sharpWidth = g_pass.sharpHeight = 0;
 }
 
-static bool EnsureSharpTarget(device* dev, uint32_t w, uint32_t h)
+static bool EnsureSharpTarget(device* dev, uint32_t w, uint32_t h, format fmt = format::r16g16b16a16_float,
+                              bool withCopy = false)
 {
-    if (g_pass.sharp.handle && g_pass.sharpWidth == w && g_pass.sharpHeight == h)
+    if (g_pass.sharp.handle && g_pass.sharpWidth == w && g_pass.sharpHeight == h && g_pass.sharpFormat == fmt &&
+        (!withCopy || g_pass.copy.handle))
         return true;
     DestroySharpTarget(dev);
-    if (!dev->create_resource(resource_desc(w, h, 1, 1, format::r16g16b16a16_float, 1, memory_heap::default_,
-                                            resource_usage::unordered_access | resource_usage::shader_resource),
+    if (!dev->create_resource(resource_desc(w, h, 1, 1, fmt, 1, memory_heap::default_,
+                                            resource_usage::unordered_access | resource_usage::shader_resource |
+                                                resource_usage::copy_source),
                               nullptr, resource_usage::unordered_access, &g_pass.sharp) ||
-        !dev->create_resource_view(g_pass.sharp, resource_usage::unordered_access, resource_view_desc(format::r16g16b16a16_float), &g_pass.sharpUav) ||
-        !dev->create_resource_view(g_pass.sharp, resource_usage::shader_resource, resource_view_desc(format::r16g16b16a16_float), &g_pass.sharpSrv)) {
-        LOGW("sharpening: failed to create %ux%u target", w, h);
+        !dev->create_resource_view(g_pass.sharp, resource_usage::unordered_access, resource_view_desc(fmt), &g_pass.sharpUav) ||
+        !dev->create_resource_view(g_pass.sharp, resource_usage::shader_resource, resource_view_desc(fmt), &g_pass.sharpSrv) ||
+        (withCopy &&
+         (!dev->create_resource(resource_desc(w, h, 1, 1, fmt, 1, memory_heap::default_,
+                                              resource_usage::shader_resource | resource_usage::copy_dest),
+                                nullptr, resource_usage::shader_resource, &g_pass.copy) ||
+          !dev->create_resource_view(g_pass.copy, resource_usage::shader_resource, resource_view_desc(fmt), &g_pass.copySrv)))) {
+        LOGW("sharpening: failed to create %ux%u target (format %u)", w, h, (unsigned)fmt);
         DestroySharpTarget(dev);
         return false;
     }
     g_pass.sharpWidth = w;
     g_pass.sharpHeight = h;
+    g_pass.sharpFormat = fmt;
     return true;
 }
 
@@ -677,12 +691,19 @@ static void ShutdownLatency(device* dev)
     g_latencyMode = kLatencyPending;
 }
 
+// Back buffer resources of the presenting swap chain: the game's final pass is the draw into one of them (at
+// native AA every scene target has the screen size, so the size alone does not identify it).
+static std::vector<uint64_t> g_backBuffers;
+
 static void OnInitSwapchain(swapchain* sc, bool)
 {
     resource_desc d = sc->get_device()->get_resource_desc(sc->get_current_back_buffer());
     g_backBufferWidth = d.texture.width;
     g_backBufferHeight = d.texture.height;
-    LOGI("swap chain %ux%u", g_backBufferWidth, g_backBufferHeight);
+    g_backBuffers.clear();
+    for (uint32_t i = 0; i < sc->get_back_buffer_count(); ++i)
+        g_backBuffers.push_back(sc->get_back_buffer(i).handle);
+    LOGI("swap chain %ux%u, %zu back buffers", g_backBufferWidth, g_backBufferHeight, g_backBuffers.size());
     // Anti-Lag 2 / frame latency follow the device that presents (helper devices come and go).
     if (sc->get_device()->get_api() == device_api::d3d11)
         g_latencyDevice = reinterpret_cast<ID3D11Device*>(sc->get_device()->get_native());
@@ -916,11 +937,18 @@ static bool ReplaceTaa(command_list* cmd)
     return true;
 }
 
+static bool DispatchRcas(command_list* cmd, resource_view in, uint32_t w, uint32_t h);
+
 // RCAS from `in` (tone-mapped, w x h) into g_pass.sharp. Caller is inside ScopedOwnState.
 static bool Sharpen(command_list* cmd, resource_view in, uint32_t w, uint32_t h)
 {
     if (!EnsureSharpTarget(cmd->get_device(), w, h))
         return false;
+    return DispatchRcas(cmd, in, w, h);
+}
+
+static bool DispatchRcas(command_list* cmd, resource_view in, uint32_t w, uint32_t h)
+{
     const resource_view none = {0};
     const float consts[4] = {SharpnessNow(), 0.0f, 0.0f, 0.0f};
     cmd->bind_pipeline(pipeline_stage::compute_shader, g_pass.rcas);
@@ -983,9 +1011,36 @@ static bool IsFinalUpscaleDraw(device* dev, uint32_t count)
     if (!g_pending.upscale && SharpnessNow() <= 0.0f)
         return false;
     const ViewInfo rt = GetViewInfo(dev, g_rtv0);
+    if (std::find(g_backBuffers.begin(), g_backBuffers.end(), rt.res) == g_backBuffers.end())
+        return false;
+    if (!g_pending.upscale)  // native AA: the tone mapper itself draws into the back buffer
+        return true;
     const ViewInfo src = GetViewInfo(dev, g_psSrv[0]);
-    return rt.width == g_backBufferWidth && rt.height == g_backBufferHeight && src.width == g_pending.width &&
-           src.height == g_pending.height;
+    return src.width == g_pending.width && src.height == g_pending.height;
+}
+
+// Native AA: there is no separate upscale pass, the tone mapper writes straight into the back buffer. Draw it,
+// then sharpen the back buffer in place (before the UI is drawn on top).
+static bool SharpenAfterToneMapper(command_list* cmd, bool indexed, uint32_t count, uint32_t instances,
+                                   uint32_t first, int32_t vertexOffset, uint32_t firstInstance)
+{
+    auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd->get_native());
+    device* dev = cmd->get_device();
+    const ViewInfo rt = GetViewInfo(dev, g_rtv0);
+    const resource back = {rt.res};
+    const resource_desc bd = dev->get_resource_desc(back);
+    const format fmt = format_to_default_typed(bd.texture.format);
+    if (indexed)
+        ctx->DrawIndexedInstanced(count, instances, first, vertexOffset, firstInstance);
+    else
+        ctx->DrawInstanced(count, instances, first, firstInstance);
+    ScopedOwnState own(ctx);
+    if (!own.ok() || !EnsureSharpTarget(dev, bd.texture.width, bd.texture.height, fmt, true))
+        return true;
+    cmd->copy_resource(back, g_pass.copy);
+    if (DispatchRcas(cmd, g_pass.copySrv, bd.texture.width, bd.texture.height))
+        cmd->copy_resource(g_pass.sharp, back);
+    return true;
 }
 
 static unsigned g_drawIndex = 0;  // draw calls so far in this frame
@@ -1012,6 +1067,8 @@ static bool MaybeUpscaleFinal(command_list* cmd, bool indexed, uint32_t n, uint3
     if (!IsFinalUpscaleDraw(cmd->get_device(), n))
         return false;
     g_pending.frame = 0;
+    if (!g_pending.upscale)
+        return SharpenAfterToneMapper(cmd, indexed, n, instances, first, vertexOffset, firstInstance);
     return ReplaceFinalPass(cmd, indexed, n, instances, first, vertexOffset, firstInstance);
 }
 
