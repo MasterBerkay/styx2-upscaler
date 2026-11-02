@@ -15,6 +15,7 @@
 #include <nvsdk_ngx.h>  // types and parameter names only: the functions come from OptiScaler, see LoadNgx
 #include "ffx_antilag2_dx11.h"  // AMD Anti-Lag 2 SDK (MIT), header-only
 #include <algorithm>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -67,11 +68,6 @@ static void OnInitPipeline(device*, pipeline_layout, uint32_t count, const pipel
 }
 
 static uint64_t g_ps = 0;
-static void OnBindPipeline(command_list*, pipeline_stage stages, pipeline pipe)
-{
-    if ((stages & pipeline_stage::pixel_shader) == pipeline_stage::pixel_shader)
-        g_ps = pipe.handle;
-}
 
 static uint64_t PsHash(uint64_t ps)
 {
@@ -168,9 +164,37 @@ static void OnMapBuffer(device* dev, resource res, uint64_t offset, uint64_t, ma
 // The parts of the View buffer ReplaceTaa reads (offset, size), see NOTES.md.
 static const uint32_t kViewParts[][2] = {{416, 16}, {512, 64}, {896, 16}, {944, 8}, {1232, 64}, {1584, 16}, {2128, 16}};
 
+// Whether 4096 bytes are a View buffer: projection w = 1 at 428, a whole TAA sample count at 2132 and
+// ViewSizeAndInvSize at 1840 (size * 1/size = 1). Many other 4096-byte buffers pass the first two by chance.
+static bool IsViewData(const uint8_t* src)
+{
+    float w, samples, size[4];
+    memcpy(&w, src + 428, 4);
+    memcpy(&samples, src + 2132, 4);
+    if (w != 1.0f || !(samples >= 1.0f && samples <= 64.0f) || samples != static_cast<float>(static_cast<int>(samples)))
+        return false;
+    memcpy(size, src + 1840, 16);
+    return size[0] >= 320.0f && size[1] >= 180.0f && std::fabs(size[0] * size[2] - 1.0f) < 1e-3f &&
+           std::fabs(size[1] * size[3] - 1.0f) < 1e-3f;
+}
+
+// Keeps the parts of a View buffer that are read; forgets any other buffer. Caller holds g_cbMutex.
+static void StoreViewParts(uint64_t buffer, const uint8_t* src)
+{
+    if (!IsViewData(src)) {
+        if (!g_viewData.empty())
+            g_viewData.erase(buffer);
+        return;
+    }
+    auto& v = g_viewData[buffer];
+    v.resize(kViewSize);
+    for (const auto& part : kViewParts)
+        memcpy(v.data() + part[0], src + part[0], part[1]);
+}
+
 // A mapped buffer is write-combined memory, very slow to read: UE4 maps a 4096-byte buffer hundreds of times per
-// frame in busy scenes, and copying each one whole cost half of the rendering thread. Only a View buffer is copied
-// (projection w = 1 at 428, TAA sample count at 2132), and only the parts that are read.
+// frame in busy scenes, and copying each one whole cost half of the rendering thread. Only a View buffer is copied,
+// and only the parts that are read.
 static void OnUnmapBuffer(device*, resource res)
 {
     std::lock_guard<std::mutex> lock(g_cbMutex);
@@ -179,17 +203,7 @@ static void OnUnmapBuffer(device*, resource res)
         return;
     const uint8_t* src = static_cast<const uint8_t*>(it->second);
     g_mapped.erase(it);
-    float w, samples;
-    memcpy(&w, src + 428, 4);
-    memcpy(&samples, src + 2132, 4);
-    if (w != 1.0f || !(samples >= 1.0f)) {
-        g_viewData.erase(res.handle);
-        return;
-    }
-    auto& v = g_viewData[res.handle];
-    v.resize(kViewSize);
-    for (const auto& part : kViewParts)
-        memcpy(v.data() + part[0], src + part[0], part[1]);
+    StoreViewParts(res.handle, src);
 }
 
 static bool OnUpdateBuffer(device* dev, const void* data, resource res, uint64_t offset, uint64_t size)
@@ -204,18 +218,8 @@ static bool OnUpdateBuffer(device* dev, const void* data, resource res, uint64_t
     if (offset + size > kViewSize)
         return false;
     const uint8_t* src = static_cast<const uint8_t*>(data);
-    if (offset == 0 && size == kViewSize) {  // whole buffer: as in OnUnmapBuffer, only View buffers and their parts
-        float w, samples;
-        memcpy(&w, src + 428, 4);
-        memcpy(&samples, src + 2132, 4);
-        if (w != 1.0f || !(samples >= 1.0f)) {
-            g_viewData.erase(res.handle);
-            return false;
-        }
-        auto& v = g_viewData[res.handle];
-        v.resize(kViewSize);
-        for (const auto& part : kViewParts)
-            memcpy(v.data() + part[0], src + part[0], part[1]);
+    if (offset == 0 && size == kViewSize) {  // whole buffer: as in OnUnmapBuffer
+        StoreViewParts(res.handle, src);
         return false;
     }
     auto& v = g_viewData[res.handle];
@@ -224,25 +228,38 @@ static bool OnUpdateBuffer(device* dev, const void* data, resource res, uint64_t
     return false;
 }
 
-// ---------------------------------------------------------------- bind tracking
+// ---------------------------------------------------------------- draw state
+// Read from the context at the few draws that can matter (full-screen triangles / quads) instead of tracking every
+// bind through ReShade events: the game binds shaders and resources thousands of times per frame, and each event
+// costs the rendering thread. In D3D11, ReShade's pipeline and view handles are the native object pointers.
 
 static uint64_t g_rtv0 = 0, g_dsv = 0;
 static uint64_t g_psSrv[8] = {};
 
-static void OnBindRenderTargets(command_list*, uint32_t count, const resource_view* rtvs, resource_view dsv)
+static void RefreshDrawState(command_list* cmd)
 {
-    g_rtv0 = count > 0 && rtvs ? rtvs[0].handle : 0;
-    g_dsv = dsv.handle;
-}
-
-static void OnPushDescriptors(command_list*, shader_stage stages, pipeline_layout, uint32_t, const descriptor_table_update& u)
-{
-    if ((stages & shader_stage::pixel) != shader_stage::pixel || u.type != descriptor_type::shader_resource_view)
-        return;
-    const auto* views = static_cast<const resource_view*>(u.descriptors);
-    for (uint32_t i = 0; i < u.count; ++i)
-        if (u.binding + i < 8)
-            g_psSrv[u.binding + i] = views[i].handle;
+    auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd->get_native());
+    ID3D11PixelShader* ps = nullptr;
+    ctx->PSGetShader(&ps, nullptr, nullptr);
+    g_ps = reinterpret_cast<uint64_t>(ps);
+    if (ps)
+        ps->Release();
+    ID3D11ShaderResourceView* srvs[8] = {};
+    ctx->PSGetShaderResources(0, 8, srvs);
+    for (int i = 0; i < 8; ++i) {
+        g_psSrv[i] = reinterpret_cast<uint64_t>(srvs[i]);
+        if (srvs[i])
+            srvs[i]->Release();
+    }
+    ID3D11RenderTargetView* rtv = nullptr;
+    ID3D11DepthStencilView* dsv = nullptr;
+    ctx->OMGetRenderTargets(1, &rtv, &dsv);
+    g_rtv0 = reinterpret_cast<uint64_t>(rtv);
+    g_dsv = reinterpret_cast<uint64_t>(dsv);
+    if (rtv)
+        rtv->Release();
+    if (dsv)
+        dsv->Release();
 }
 
 // ---------------------------------------------------------------- motion vector pass
@@ -1035,11 +1052,15 @@ static bool ReplaceFinalPass(command_list* cmd, bool indexed, uint32_t count, ui
 
 // The final pass: full-screen draw into the back buffer whose t0 has the render resolution, in a frame whose
 // TAA pass left work for it.
-static bool IsFinalUpscaleDraw(device* dev, uint32_t count)
+static bool IsFinalUpscaleDraw(command_list* cmd, uint32_t count)
 {
-    if (g_pending.frame != g_frameId || count > 6 || !g_rtv0 || !g_psSrv[0])
+    if (g_pending.frame != g_frameId || count > 6)
         return false;
     if (!g_pending.upscale && SharpnessNow() <= 0.0f)
+        return false;
+    device* dev = cmd->get_device();
+    RefreshDrawState(cmd);
+    if (!g_rtv0 || !g_psSrv[0])
         return false;
     const ViewInfo rt = GetViewInfo(dev, g_rtv0);
     if (std::find(g_backBuffers.begin(), g_backBuffers.end(), rt.res) == g_backBuffers.end())
@@ -1095,7 +1116,7 @@ static void LogCandidate(device* dev)
 static bool MaybeUpscaleFinal(command_list* cmd, bool indexed, uint32_t n, uint32_t instances, uint32_t first,
                               int32_t vertexOffset, uint32_t firstInstance)
 {
-    if (!IsFinalUpscaleDraw(cmd->get_device(), n))
+    if (!IsFinalUpscaleDraw(cmd, n))
         return false;
     g_pending.frame = 0;
     if (!g_pending.upscale)
@@ -1116,6 +1137,7 @@ static bool OnDrawIndexed(command_list* cmd, uint32_t n, uint32_t instances, uin
         return true;
     if (n != 3)
         return false;
+    RefreshDrawState(cmd);
     if (g_logActive && IsTaaDraw(cmd->get_device(), n))
         LogCandidate(cmd->get_device());
     if (g_replacedFrame == g_frameId)
@@ -1511,10 +1533,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBuffer);
         reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBuffer);
         reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBuffer);
-        reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
-        reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
         reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipeline);
-        reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
         reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
         reshade::register_event<reshade::addon_event::draw>(OnDraw);
         reshade::register_event<reshade::addon_event::present>(OnPresent);
